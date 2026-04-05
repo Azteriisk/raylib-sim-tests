@@ -8,7 +8,7 @@ It includes:
 - Property-driven rendering (static color or per-block shader function).
 - Advanced stacked growth behavior (current example: bulb cloud growth and merge logic).
 
-All core logic currently lives in `main.c`.
+Core logic is now split into focused modules.
 
 ## Build and Run
 
@@ -22,12 +22,22 @@ All core logic currently lives in `main.c`.
 make
 ```
 
+### Run
+```bash
+./main
+```
+On Windows PowerShell:
+```powershell
+.\main.exe
+```
+
 ## Current Controls
 
 - `Left Click`: paint `SAND`
 - `Right Click`: paint `SHADER_BLOCK`
 - `Space`: paint `WATER`
-- `E`: paint `BULB_SEED`
+- `E`: erase (paint `EMPTY`, immutable blocks are preserved)
+- `B`: paint `BULB_SEED`
 - `C`: clear world
 
 UI sliders (in-game):
@@ -41,7 +51,7 @@ UI sliders (in-game):
 
 ### 1. Blocks are defined in one registry
 
-`BlockRegistry[]` (in `main.c`) is the source of truth for per-block behavior and visuals.
+`BlockRegistry[]` (in `sim_state.c`) is the source of truth for per-block behavior and visuals.
 
 `BlockProperties` currently supports:
 - Physics and occupancy:
@@ -67,7 +77,7 @@ UI sliders (in-game):
 
 ### 2. Input actions are binding-driven
 
-`kInputBindings[]` maps device input to `CellType` paint output.
+`kInputBindings[]` (in `input_ui.c`) maps device input to `CellType` paint output.
 
 ### 3. Simulation uses behavior modules
 
@@ -143,12 +153,11 @@ If `colorShader == NULL`, the engine renders `baseColor` directly.
 
 ## Notes on Architecture
 
-- The project is intentionally single-file right now for iteration speed.
-- The framework is already data-driven at the block-property level.
-- Advanced growth/stack systems are still explicit modules, but their behavior gates are now stored in `BlockProperties`.
+- `sim.h`: shared types, globals, constants, and public function interfaces.
+- `main.c`: app entrypoint and Win32 live-resize hook.
+- `sim_state.c`: global state, block registry, grid memory/state helpers, utility math.
+- `physics_render.c`: movement rules, per-cell physics step, render pipeline, color shader functions.
+- `input_ui.c`: key/mouse bindings, slider UI, paint brush logic, frame tick orchestration.
+- `bulb.c`: bulb growth system, merge logic, and stacked-shape rebuild.
 
-If you split this into multiple files later, a good first cut is:
-- `blocks.h/.c` for enums + registry
-- `physics.h/.c`
-- `render.h/.c`
-- `behaviors_bulb.h/.c`
+The framework is data-driven at the block-property level, while advanced families (like bulb growth) stay modular and can be expanded similarly.
