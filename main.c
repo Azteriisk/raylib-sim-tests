@@ -1,4 +1,4 @@
-#include "raylib.h"
+#include "lib/raylib.h"
 #include <math.h>
 #include <stdlib.h> // For malloc, free
 #include <string.h> // For memset
@@ -42,9 +42,12 @@ int drawBrushRadiusPixels = 6;
 // simulation cells using cellSizePixels.
 int gravitySpeedPixelsPerStep = 6;
 int bulbStemBulbRatioPercent = 35;
+int bulbMergeOverlapPercent = 35;
 
 // Physics Simulation Constants
 #define PHYSICS_TICK_RATE 60.0f
+#define BULB_REBUILD_HZ 18.0f
+#define BULB_MERGE_OVERLAP_RATIO 0.35f
 
 // Dynamic variables updated each frame defining the currently visible window
 // chunk
@@ -59,11 +62,19 @@ typedef enum {
   EMPTY = 0,
   SAND,         // Demonstrates physics/spatial rules
   WATER,        // Demonstrates liquid-like spreading
-  BULB_SEED,  // Falls and contributes to Bulb growth
-  BULB_BLOCK, // Grown Bulb structure cells
+  BULB_SEED,    // Falls and contributes to Bulb growth
+  BULB_BLOCK,   // Grown Bulb structure cells
   SHADER_BLOCK, // Demonstrates time/color rules
   WALL          // Static indestructible environment
 } CellType;
+
+typedef enum { OUTLINE_NONE = 0, OUTLINE_EXTERIOR } OutlineMode;
+typedef enum { STACK_SHAPE_NONE = 0, STACK_SHAPE_MUSHROOM_CLOUD } StackShape;
+typedef enum { MERGE_NONE = 0, MERGE_OVERLAP } MergeBehavior;
+typedef Color (*ColorShaderFn)(int x, int y, float timeAlive, Color baseColor);
+
+Color GetShaderOscillatedColor(int x, int y, float timeAlive, Color baseColor);
+Color GetBulbShaderColor(int x, int y, float timeAlive, Color baseColor);
 
 // Define universal attributes that can be enabled specifically per cell type
 typedef struct {
@@ -75,30 +86,53 @@ typedef struct {
   float gravityMoveChance; // 0.0-1.0 chance to attempt gravity each tick
   float spreadMoveChance;  // 0.0-1.0 chance to attempt lateral spread
   int spreadDistanceCells; // Max lateral travel when spreading
+  Color baseColor;
+  ColorShaderFn colorShader;
+  OutlineMode outlineMode;
+  Color outlineColor;
+  int outlineThicknessCells;
+  StackShape stackShape;
+  MergeBehavior mergeBehavior;
+  float mergeOverlapRatio;
+  int mergeAttachReachBias;
 } BlockProperties;
 
 // Global Registry permanently attaching behaviors directly to specific blocks!
 // Any omitted fields default to zero/false via C aggregate initialization.
 const BlockProperties BlockRegistry[] = {
-    [EMPTY] = {},
+    [EMPTY] = {.baseColor = {0, 0, 0, 0}},
     [SAND] = {.isSolid = true,
               .affectedByGravity = true,
+              .baseColor = {242, 209, 107, 255},
               .mass = 1.35f,
               .gravityMoveChance = 1.0f},
     [WATER] = {.isSolid = true,
                .affectedByGravity = true,
                .spreadsLikeLiquid = true,
+               .baseColor = {73, 166, 219, 255},
                .mass = 0.72f,
                .gravityMoveChance = 0.8f,
                .spreadMoveChance = 0.9f,
                .spreadDistanceCells = 8},
     [BULB_SEED] = {.isSolid = true,
                    .affectedByGravity = true,
+                   .baseColor = {220, 138, 186, 255},
                    .mass = 1.0f,
                    .gravityMoveChance = 1.0f},
-    [BULB_BLOCK] = {.isSolid = true},
-    [SHADER_BLOCK] = {},
-    [WALL] = {.isSolid = true, .isImmutable = true}};
+    [BULB_BLOCK] = {.isSolid = true,
+                    .baseColor = {46, 150, 86, 255},
+                    .colorShader = GetBulbShaderColor,
+                    .outlineMode = OUTLINE_EXTERIOR,
+                    .outlineColor = {255, 30, 180, 255},
+                    .outlineThicknessCells = 1,
+                    .stackShape = STACK_SHAPE_MUSHROOM_CLOUD,
+                    .mergeBehavior = MERGE_OVERLAP,
+                    .mergeOverlapRatio = 0.35f,
+                    .mergeAttachReachBias = -2},
+    [SHADER_BLOCK] = {.baseColor = {200, 122, 255, 255},
+                      .colorShader = GetShaderOscillatedColor},
+    [WALL] = {
+        .isSolid = true, .isImmutable = true, .baseColor = {80, 80, 80, 255}}};
 
 typedef struct {
   CellType type;
@@ -112,6 +146,7 @@ PixelCell *nextGrid = NULL;
 int uiActiveControlIndex = -1;
 bool uiPointerCaptured = false;
 bool bulbNeedsRebuild = false;
+float bulbRebuildAccumulator = 0.0f;
 
 #define MAX_BULB_NODES 1024
 typedef struct {
@@ -130,11 +165,15 @@ BulbNode bulbNodes[MAX_BULB_NODES];
 bool IsSolid(CellType type);
 bool IsImmutable(CellType type);
 bool RollChance(float chance);
-Color GetBulbShaderColor(int x, int y, float timeAlive);
 CellType GetResolvedCellType(int x, int y);
 bool TryAbsorbBulbSeed(int x, int y);
 void ClearAllBulbs(void);
 void RebuildBulbs(void);
+void AddMassToBulbNode(int index, int delta);
+int MergeBulbNodeWithNearest(int index);
+int FindBulbNodeByReach(int x, int y, int extraReach);
+int FindNearestBulbNodeIndex(int x, int y);
+void MergeBulbClusterAt(int index);
 
 int GetGravitySpeedInCells(void);
 int GetGravitySpeedInCellsForMass(float mass);
@@ -145,24 +184,7 @@ void UpdateUIControls(void);
 void RenderUIControls(void);
 
 // Generate base colors for specific types
-Color GetCellColor(CellType type) {
-  switch (type) {
-  case SAND:
-    return (Color){242, 209, 107, 255};
-  case WATER:
-    return (Color){73, 166, 219, 255};
-  case BULB_SEED:
-    return (Color){220, 138, 186, 255};
-  case BULB_BLOCK:
-    return (Color){199, 83, 163, 255};
-  case SHADER_BLOCK:
-    return PURPLE;
-  case WALL:
-    return DARKGRAY;
-  default:
-    return BLANK;
-  }
-}
+Color GetCellColor(CellType type) { return BlockRegistry[type].baseColor; }
 
 // Memory Allocation logic
 void ResizeGrid(int targetCols, int targetRows) {
@@ -291,11 +313,67 @@ CellType GetResolvedCellType(int x, int y) {
 void ClearAllBulbs(void) {
   memset(bulbNodes, 0, sizeof(bulbNodes));
   bulbNeedsRebuild = false;
+  bulbRebuildAccumulator = 0.0f;
 }
 
-int FindNearestBulbNodeIndex(int x, int y, int maxDistSq) {
+void GetBulbShapeAxesFromMass(int mass, int *bodyRadiusX, int *bodyRadiusY) {
+  int safeMass = mass < 1 ? 1 : mass;
+  float stemRatio = (float)ClampInt(bulbStemBulbRatioPercent, 10, 90) / 100.0f;
+  float bulbBudget = (float)safeMass * (1.0f - stemRatio);
+  float size = sqrtf(fmaxf(1.0f, bulbBudget));
+  // Mushroom-cloud cap: broad, but with meaningful vertical dome.
+  int rx = 4 + (int)floorf(size * 1.45f);
+  int ry = 3 + (int)floorf(size * 0.95f);
+  int maxRy = (int)floorf((float)rx * 0.85f);
+  if (maxRy < 3) {
+    maxRy = 3;
+  }
+  if (ry > maxRy) {
+    ry = maxRy;
+  }
+  *bodyRadiusX = rx;
+  *bodyRadiusY = ry;
+}
+
+float GetBulbOutlineLength(const BulbNode *node) {
+  int rx = 0;
+  int ry = 0;
+  GetBulbShapeAxesFromMass(node->mass, &rx, &ry);
+  float a = (float)rx;
+  float b = (float)ry;
+  const float pi = 3.14159265f;
+  return 2.0f * pi * sqrtf((a * a + b * b) * 0.5f);
+}
+
+int GetBulbMergeReach(const BulbNode *node) {
+  float outline = GetBulbOutlineLength(node);
+  int reach = (int)floorf(outline * 0.12f);
+  if (reach < 6) {
+    reach = 6;
+  }
+  if (reach > 60) {
+    reach = 60;
+  }
+  return reach;
+}
+
+void AddMassToBulbNode(int index, int delta) {
+  if (index < 0 || index >= MAX_BULB_NODES || !bulbNodes[index].active) {
+    return;
+  }
+  bulbNodes[index].mass += delta;
+  if (bulbNodes[index].mass > 4096) {
+    bulbNodes[index].mass = 4096;
+  }
+  if (bulbNodes[index].mass < 1) {
+    bulbNodes[index].mass = 1;
+  }
+  bulbNeedsRebuild = true;
+}
+
+int FindBulbNodeByReach(int x, int y, int extraReach) {
   int bestIndex = -1;
-  int bestDistSq = maxDistSq;
+  int bestDistSq = 2147483647;
   for (int i = 0; i < MAX_BULB_NODES; i++) {
     if (!bulbNodes[i].active) {
       continue;
@@ -303,7 +381,11 @@ int FindNearestBulbNodeIndex(int x, int y, int maxDistSq) {
     int dx = bulbNodes[i].anchorX - x;
     int dy = bulbNodes[i].anchorY - y;
     int distSq = dx * dx + dy * dy;
-    if (distSq <= bestDistSq) {
+    int reach = GetBulbMergeReach(&bulbNodes[i]) + extraReach;
+    if (reach < 1) {
+      reach = 1;
+    }
+    if (distSq <= reach * reach && distSq < bestDistSq) {
       bestDistSq = distSq;
       bestIndex = i;
     }
@@ -311,7 +393,98 @@ int FindNearestBulbNodeIndex(int x, int y, int maxDistSq) {
   return bestIndex;
 }
 
-void StampBulbCell(PixelCell *grid, int x, int y) {
+int FindNearestBulbNodeIndex(int x, int y) {
+  int bestIndex = -1;
+  int bestDistSq = 2147483647;
+  for (int i = 0; i < MAX_BULB_NODES; i++) {
+    if (!bulbNodes[i].active) {
+      continue;
+    }
+    int dx = bulbNodes[i].anchorX - x;
+    int dy = bulbNodes[i].anchorY - y;
+    int distSq = dx * dx + dy * dy;
+    if (distSq < bestDistSq) {
+      bestDistSq = distSq;
+      bestIndex = i;
+    }
+  }
+  return bestIndex;
+}
+
+int MergeBulbNodeWithNearest(int index) {
+  if (index < 0 || index >= MAX_BULB_NODES || !bulbNodes[index].active) {
+    return -1;
+  }
+  const BlockProperties *stackProps = &BlockRegistry[BULB_BLOCK];
+  if (stackProps->mergeBehavior == MERGE_NONE) {
+    return -1;
+  }
+  float overlapRatio = stackProps->mergeOverlapRatio > 0.0f
+                           ? stackProps->mergeOverlapRatio
+                           : BULB_MERGE_OVERLAP_RATIO;
+  overlapRatio = (float)ClampInt(bulbMergeOverlapPercent, 5, 90) / 100.0f;
+
+  int bestPartner = -1;
+  int bestDistSq = 2147483647;
+  for (int i = 0; i < MAX_BULB_NODES; i++) {
+    if (i == index || !bulbNodes[i].active) {
+      continue;
+    }
+    int dx = bulbNodes[index].anchorX - bulbNodes[i].anchorX;
+    int dy = bulbNodes[index].anchorY - bulbNodes[i].anchorY;
+    int distSq = dx * dx + dy * dy;
+    int reachA = GetBulbMergeReach(&bulbNodes[index]);
+    int reachB = GetBulbMergeReach(&bulbNodes[i]);
+    int minReach = reachA < reachB ? reachA : reachB;
+    int requiredOverlap = (int)floorf((float)minReach * overlapRatio);
+    if (requiredOverlap < 1) {
+      requiredOverlap = 1;
+    }
+    int mergeDistance = reachA + reachB - requiredOverlap;
+    if (mergeDistance < 1) {
+      mergeDistance = 1;
+    }
+
+    if (distSq <= mergeDistance * mergeDistance && distSq < bestDistSq) {
+      bestDistSq = distSq;
+      bestPartner = i;
+    }
+  }
+
+  if (bestPartner < 0) {
+    return -1;
+  }
+
+  int massA = bulbNodes[index].mass;
+  int massB = bulbNodes[bestPartner].mass;
+  int totalMass = massA + massB;
+  if (totalMass > 4096) {
+    totalMass = 4096;
+  }
+  int weightedX =
+      bulbNodes[index].anchorX * massA + bulbNodes[bestPartner].anchorX * massB;
+  int weightedY =
+      bulbNodes[index].anchorY * massA + bulbNodes[bestPartner].anchorY * massB;
+  bulbNodes[index].anchorX = weightedX / (massA + massB);
+  bulbNodes[index].anchorY = weightedY / (massA + massB);
+  bulbNodes[index].mass = totalMass;
+  bulbNodes[bestPartner].active = false;
+  bulbNeedsRebuild = true;
+  return index;
+}
+
+void MergeBulbClusterAt(int index) {
+  int current = index;
+  while (current >= 0) {
+    int mergedIndex = MergeBulbNodeWithNearest(current);
+    if (mergedIndex < 0) {
+      break;
+    }
+    current = mergedIndex;
+  }
+}
+
+void StampBulbCell(PixelCell *grid, int x, int y, CellType type) {
   if (x < 0 || x >= gridCols || y < 0 || y >= gridRows) {
     return;
   }
@@ -319,65 +492,94 @@ void StampBulbCell(PixelCell *grid, int x, int y) {
   if (IsImmutable(existing.type)) {
     return;
   }
-  SET_CELL(grid, x, y, BULB_BLOCK, GetCellColor(BULB_BLOCK), 0);
+  SET_CELL(grid, x, y, type, GetCellColor(type), 0);
 }
 
-void StampBulbShape(PixelCell *grid, const BulbNode *node) {
+void StampBulbShape(PixelCell *grid, const BulbNode *node, CellType blockType) {
+  const BlockProperties *stackProps = &BlockRegistry[blockType];
+  if (stackProps->stackShape == STACK_SHAPE_NONE) {
+    StampBulbCell(grid, node->anchorX, node->anchorY, blockType);
+    return;
+  }
+
   int mass = node->mass < 1 ? 1 : node->mass;
-  float stemRatio =
-      (float)ClampInt(bulbStemBulbRatioPercent, 10, 90) / 100.0f;
+  float stemRatio = (float)ClampInt(bulbStemBulbRatioPercent, 10, 90) / 100.0f;
   float stemBudget = (float)mass * stemRatio;
-  float bulbBudget = (float)mass * (1.0f - stemRatio);
-  int stemHeight = 1 + (int)floorf(sqrtf(stemBudget) * 0.4f);
-  int stemHalfWidth = (int)floorf(sqrtf(stemBudget) * 0.6f);
-  int bodyRadiusX = 2 + (int)floorf(sqrtf(fmaxf(1.0f, bulbBudget)) * 1.1f);
-  int bodyRadiusY = 3 + (int)floorf((float)bodyRadiusX * 1.45f);
-  int tipRadius = 1 + (int)floorf((float)bodyRadiusX * 0.35f);
-  if (tipRadius > bodyRadiusX - 1) {
-    tipRadius = bodyRadiusX - 1;
+  int stemHeight = 2 + (int)floorf(sqrtf(stemBudget) * 0.55f);
+  int stemHalfWidth = 1 + (int)floorf(sqrtf(stemBudget) * 0.20f);
+  int capRadiusX = 0;
+  int capRadiusY = 0;
+  GetBulbShapeAxesFromMass(mass, &capRadiusX, &capRadiusY);
+  int minStemHeight = capRadiusY / 2;
+  if (minStemHeight < 2) {
+    minStemHeight = 2;
   }
-  if (tipRadius < 1) {
-    tipRadius = 1;
+  if (stemHeight < minStemHeight) {
+    stemHeight = minStemHeight;
   }
-  if (stemHeight > bodyRadiusY) {
-    stemHeight = bodyRadiusY;
+  int maxStemHalfWidth = capRadiusX - 2;
+  if (maxStemHalfWidth < 1) {
+    maxStemHalfWidth = 1;
+  }
+  if (stemHalfWidth > maxStemHalfWidth) {
+    stemHalfWidth = maxStemHalfWidth;
   }
 
   int stemTopY = node->anchorY + stemHeight;
   int stemBottomY = node->anchorY + 1;
   for (int y = stemBottomY; y <= stemTopY; y++) {
-    for (int x = node->anchorX - stemHalfWidth; x <= node->anchorX + stemHalfWidth;
-         x++) {
-      StampBulbCell(grid, x, y);
+    float t =
+        stemHeight > 0 ? (float)(y - stemBottomY) / (float)stemHeight : 0.0f;
+    int taperedHalfWidth =
+        stemHalfWidth + (int)floorf(t * ((float)capRadiusX * 0.18f));
+    for (int x = node->anchorX - taperedHalfWidth;
+         x <= node->anchorX + taperedHalfWidth; x++) {
+      StampBulbCell(grid, x, y, blockType);
     }
   }
 
+  // Crown dome.
   int centerX = node->anchorX;
-  int centerY = stemTopY + bodyRadiusY - 1;
-  for (int dy = -bodyRadiusY; dy <= bodyRadiusY; dy++) {
-    for (int dx = -bodyRadiusX; dx <= bodyRadiusX; dx++) {
-      float nx = bodyRadiusX > 0 ? (float)dx / (float)bodyRadiusX : 0.0f;
-      float ny = bodyRadiusY > 0 ? (float)dy / (float)bodyRadiusY : 0.0f;
+  int centerY = stemTopY + (int)floorf((float)capRadiusY * 0.85f);
+  for (int dy = -capRadiusY; dy <= capRadiusY; dy++) {
+    for (int dx = -capRadiusX; dx <= capRadiusX; dx++) {
+      float nx = capRadiusX > 0 ? (float)dx / (float)capRadiusX : 0.0f;
+      float ny = capRadiusY > 0 ? (float)dy / (float)capRadiusY : 0.0f;
+      if (ny < -0.55f) {
+        continue;
+      }
       if (nx * nx + ny * ny <= 1.0f) {
-        StampBulbCell(grid, centerX + dx, centerY + dy);
+        StampBulbCell(grid, centerX + dx, centerY + dy, blockType);
       }
     }
   }
 
-  int tipCenterY = centerY + bodyRadiusY - tipRadius;
-  for (int dy = -tipRadius; dy <= tipRadius; dy++) {
-    for (int dx = -tipRadius; dx <= tipRadius; dx++) {
-      if (dx * dx + dy * dy <= tipRadius * tipRadius) {
-        StampBulbCell(grid, centerX + dx, tipCenterY + dy);
+  // Lower skirt around the dome for a mushroom-cloud ring.
+  int skirtRadiusX = capRadiusX + capRadiusX / 3 + 1;
+  int skirtRadiusY = capRadiusY / 2;
+  if (skirtRadiusY < 2) {
+    skirtRadiusY = 2;
+  }
+  int skirtCenterY = stemTopY + (int)floorf((float)skirtRadiusY * 0.35f);
+  for (int dy = -skirtRadiusY; dy <= skirtRadiusY; dy++) {
+    for (int dx = -skirtRadiusX; dx <= skirtRadiusX; dx++) {
+      float nx = skirtRadiusX > 0 ? (float)dx / (float)skirtRadiusX : 0.0f;
+      float ny = skirtRadiusY > 0 ? (float)dy / (float)skirtRadiusY : 0.0f;
+      if (ny < -0.25f) {
+        continue;
+      }
+      if (nx * nx + ny * ny <= 1.0f) {
+        StampBulbCell(grid, centerX + dx, skirtCenterY + dy, blockType);
       }
     }
   }
 }
 
 void RebuildBulbs(void) {
+  CellType stackType = BULB_BLOCK;
   for (int y = 0; y < gridRows; y++) {
     for (int x = 0; x < gridCols; x++) {
-      if (GET_CELL(currentGrid, x, y).type == BULB_BLOCK) {
+      if (GET_CELL(currentGrid, x, y).type == stackType) {
         SET_CELL(currentGrid, x, y, EMPTY, BLANK, 0);
       }
     }
@@ -392,27 +594,27 @@ void RebuildBulbs(void) {
       bulbNodes[i].active = false;
       continue;
     }
-    StampBulbShape(currentGrid, &bulbNodes[i]);
+    StampBulbShape(currentGrid, &bulbNodes[i], stackType);
   }
   bulbNeedsRebuild = false;
 }
 
 bool AddBulbMassAt(int anchorX, int anchorY) {
-  int nearbyIndex = FindNearestBulbNodeIndex(anchorX, anchorY, 9);
+  const BlockProperties *stackProps = &BlockRegistry[BULB_BLOCK];
+  int nearbyIndex =
+      FindBulbNodeByReach(anchorX, anchorY, stackProps->mergeAttachReachBias);
   if (nearbyIndex >= 0) {
-    bulbNodes[nearbyIndex].mass++;
-    if (bulbNodes[nearbyIndex].mass > 4096) {
-      bulbNodes[nearbyIndex].mass = 4096;
-    }
-    bulbNeedsRebuild = true;
+    AddMassToBulbNode(nearbyIndex, 1);
+    MergeBulbClusterAt(nearbyIndex);
     return true;
   }
 
   for (int i = 0; i < MAX_BULB_NODES; i++) {
     if (!bulbNodes[i].active) {
-      bulbNodes[i] =
-          (BulbNode){.active = true, .anchorX = anchorX, .anchorY = anchorY, .mass = 1};
+      bulbNodes[i] = (BulbNode){
+          .active = true, .anchorX = anchorX, .anchorY = anchorY, .mass = 1};
       bulbNeedsRebuild = true;
+      MergeBulbClusterAt(i);
       return true;
     }
   }
@@ -420,6 +622,9 @@ bool AddBulbMassAt(int anchorX, int anchorY) {
 }
 
 bool TryAbsorbBulbSeed(int x, int y) {
+  int absorbIndex = FindBulbNodeByReach(x, y, 2);
+  CellType belowType = GetResolvedCellType(x, y - 1);
+
   bool touchingBulb = false;
   for (int dy = -1; dy <= 1; dy++) {
     for (int dx = -1; dx <= 1; dx++) {
@@ -432,27 +637,13 @@ bool TryAbsorbBulbSeed(int x, int y) {
     }
   }
 
-  if (touchingBulb) {
-    int nearest = FindNearestBulbNodeIndex(x, y, 2500);
-    if (nearest >= 0) {
-      bulbNodes[nearest].mass++;
-      if (bulbNodes[nearest].mass > 4096) {
-        bulbNodes[nearest].mass = 4096;
-      }
-      bulbNeedsRebuild = true;
-      return true;
+  if (touchingBulb || belowType == BULB_BLOCK) {
+    if (absorbIndex < 0) {
+      absorbIndex = FindNearestBulbNodeIndex(x, y);
     }
-  }
-
-  CellType belowType = GetResolvedCellType(x, y - 1);
-  if (belowType == BULB_BLOCK) {
-    int nearest = FindNearestBulbNodeIndex(x, y, 2500);
-    if (nearest >= 0) {
-      bulbNodes[nearest].mass++;
-      if (bulbNodes[nearest].mass > 4096) {
-        bulbNodes[nearest].mass = 4096;
-      }
-      bulbNeedsRebuild = true;
+    if (absorbIndex >= 0) {
+      AddMassToBulbNode(absorbIndex, 1);
+      MergeBulbClusterAt(absorbIndex);
       return true;
     }
   }
@@ -475,8 +666,8 @@ bool IsImmutable(CellType type) { return BlockRegistry[type].isImmutable; }
 // Checks left and right randomly at a specified Y level to see if a cell can
 // slide there. If targetY is below sourceY, that row has already been
 // processed this tick and should be read from nextGrid.
-bool TryScatter(int x, int sourceY, int targetY, int maxDistance,
-                int *nextX, int *nextY) {
+bool TryScatter(int x, int sourceY, int targetY, int maxDistance, int *nextX,
+                int *nextY) {
   bool goLeftFirst = (GetRandomValue(0, 1) == 0);
   int firstDir = goLeftFirst ? -1 : 1;
   int secondDir = goLeftFirst ? 1 : -1;
@@ -490,10 +681,9 @@ bool TryScatter(int x, int sourceY, int targetY, int maxDistance,
       if (scanX < 0 || scanX >= gridCols) {
         break;
       }
-      MoveCellState state =
-          targetRowProcessed
-              ? GetProcessedRowMoveCellState(scanX, targetY)
-              : GetMoveCellState(scanX, targetY);
+      MoveCellState state = targetRowProcessed
+                                ? GetProcessedRowMoveCellState(scanX, targetY)
+                                : GetMoveCellState(scanX, targetY);
 
       if (state == MOVE_SOLID) {
         break;
@@ -547,19 +737,36 @@ bool ApplyGravity(int x, int y, const BlockProperties *props, int *nextX,
 }
 
 // Visual Oscillations: Pulses colors dynamically over time
-Color GetShaderOscillatedColor(int x, int y, float timeAlive) {
-  float r = sinf(timeAlive * 3.0f + x * 0.1f) * 127.0f + 128.0f;
-  float g = sinf(timeAlive * 2.0f + y * 0.1f) * 127.0f + 128.0f;
-  float b = sinf(timeAlive * 4.0f) * 127.0f + 128.0f;
+Color GetShaderOscillatedColor(int x, int y, float timeAlive, Color baseColor) {
+  float waveR = sinf(timeAlive * 3.0f + x * 0.1f) * 0.5f + 0.5f;
+  float waveG = sinf(timeAlive * 2.0f + y * 0.1f) * 0.5f + 0.5f;
+  float waveB = sinf(timeAlive * 4.0f) * 0.5f + 0.5f;
+  float r = (float)baseColor.r * 0.45f + waveR * 145.0f;
+  float g = (float)baseColor.g * 0.45f + waveG * 145.0f;
+  float b = (float)baseColor.b * 0.45f + waveB * 145.0f;
+  if (r > 255.0f)
+    r = 255.0f;
+  if (g > 255.0f)
+    g = 255.0f;
+  if (b > 255.0f)
+    b = 255.0f;
   return (Color){(unsigned char)r, (unsigned char)g, (unsigned char)b, 255};
 }
 
-Color GetBulbShaderColor(int x, int y, float timeAlive) {
+Color GetBulbShaderColor(int x, int y, float timeAlive, Color baseColor) {
   float pulse = sinf(timeAlive * 2.5f + x * 0.18f - y * 0.11f) * 0.5f + 0.5f;
-  unsigned char r = (unsigned char)(36 + pulse * 24.0f);
-  unsigned char g = (unsigned char)(130 + pulse * 60.0f);
-  unsigned char b = (unsigned char)(72 + pulse * 30.0f);
-  return (Color){r, g, b, 255};
+  float shade = 0.68f + pulse * 0.58f;
+  float r = (float)baseColor.r * shade;
+  float g = (float)baseColor.g * shade;
+  float b = (float)baseColor.b * shade;
+  if (r > 255.0f)
+    r = 255.0f;
+  if (g > 255.0f)
+    g = 255.0f;
+  if (b > 255.0f)
+    b = 255.0f;
+  unsigned char a = baseColor.a > 0 ? baseColor.a : 255;
+  return (Color){(unsigned char)r, (unsigned char)g, (unsigned char)b, a};
 }
 
 bool RollChance(float chance) {
@@ -628,7 +835,14 @@ void ProcessPhysics(float deltaTime) {
   }
   SwapGrids();
   if (bulbNeedsRebuild) {
-    RebuildBulbs();
+    bulbRebuildAccumulator += deltaTime;
+    float rebuildStep = 1.0f / BULB_REBUILD_HZ;
+    if (bulbRebuildAccumulator >= rebuildStep) {
+      RebuildBulbs();
+      bulbRebuildAccumulator = 0.0f;
+    }
+  } else {
+    bulbRebuildAccumulator = 0.0f;
   }
 }
 
@@ -641,32 +855,42 @@ void RenderWorld(void) {
     for (int x = 0; x < gridCols; x++) {
       PixelCell cell = GET_CELL(currentGrid, x, y);
       if (cell.type != EMPTY) {
+        const BlockProperties *renderProps = &BlockRegistry[cell.type];
         Color drawColor = cell.color;
-        if (cell.type == SHADER_BLOCK) {
-          drawColor = GetShaderOscillatedColor(x, y, cell.timeAlive);
-        } else if (cell.type == BULB_BLOCK) {
-          drawColor = GetBulbShaderColor(x, y, cell.timeAlive);
+        if (renderProps->colorShader != NULL) {
+          drawColor = renderProps->colorShader(x, y, cell.timeAlive,
+                                               renderProps->baseColor);
         }
         int screenY = GetScreenHeight() - (y + 1) * cellSizePixels;
         DrawRectangle(x * cellSizePixels, screenY, cellSizePixels,
                       cellSizePixels, drawColor);
 
-        if (cell.type == BULB_BLOCK) {
-          Color outlineColor = (Color){255, 30, 180, 255};
+        if (renderProps->outlineMode == OUTLINE_EXTERIOR) {
+          Color outlineColor = renderProps->outlineColor.a > 0
+                                   ? renderProps->outlineColor
+                                   : (Color){255, 30, 180, 255};
           int px = x * cellSizePixels;
           int py = screenY;
-          int thickness = cellSizePixels >= 4 ? 2 : 1;
-          if (InspectCell(x - 1, y).type != BULB_BLOCK) {
+          int thickness = renderProps->outlineThicknessCells > 0
+                              ? renderProps->outlineThicknessCells
+                              : (cellSizePixels >= 4 ? 2 : 1);
+          if (thickness < 1) {
+            thickness = 1;
+          }
+          if (thickness > cellSizePixels) {
+            thickness = cellSizePixels;
+          }
+          if (InspectCell(x - 1, y).type != cell.type) {
             DrawRectangle(px, py, thickness, cellSizePixels, outlineColor);
           }
-          if (InspectCell(x + 1, y).type != BULB_BLOCK) {
+          if (InspectCell(x + 1, y).type != cell.type) {
             DrawRectangle(px + cellSizePixels - thickness, py, thickness,
                           cellSizePixels, outlineColor);
           }
-          if (InspectCell(x, y + 1).type != BULB_BLOCK) {
+          if (InspectCell(x, y + 1).type != cell.type) {
             DrawRectangle(px, py, cellSizePixels, thickness, outlineColor);
           }
-          if (InspectCell(x, y - 1).type != BULB_BLOCK) {
+          if (InspectCell(x, y - 1).type != cell.type) {
             DrawRectangle(px, py + cellSizePixels - thickness, cellSizePixels,
                           thickness, outlineColor);
           }
@@ -722,9 +946,11 @@ int ClampInt(int value, int minValue, int maxValue) {
   return value;
 }
 
-int GetUIControlSettings(UIControlSetting settings[4]) {
-  settings[0] = (UIControlSetting){
-      .label = "Cell Px", .value = &cellSizePixels, .minValue = 1, .maxValue = 8};
+int GetUIControlSettings(UIControlSetting settings[5]) {
+  settings[0] = (UIControlSetting){.label = "Cell Px",
+                                   .value = &cellSizePixels,
+                                   .minValue = 1,
+                                   .maxValue = 8};
   settings[1] = (UIControlSetting){.label = "Brush Px",
                                    .value = &drawBrushRadiusPixels,
                                    .minValue = 0,
@@ -737,10 +963,14 @@ int GetUIControlSettings(UIControlSetting settings[4]) {
                                    .value = &bulbStemBulbRatioPercent,
                                    .minValue = 10,
                                    .maxValue = 90};
-  return 4;
+  settings[4] = (UIControlSetting){.label = "Merge %",
+                                   .value = &bulbMergeOverlapPercent,
+                                   .minValue = 5,
+                                   .maxValue = 90};
+  return 5;
 }
 
-int GetUIControlSettingsCount(void) { return 4; }
+int GetUIControlSettingsCount(void) { return 5; }
 
 Rectangle GetUIControlsPanelRect(int settingCount) {
   float rowHeight = 24.0f;
@@ -780,7 +1010,7 @@ int GetSliderValueFromMouse(const UIControlSetting *setting, Rectangle track,
 }
 
 void UpdateUIControls(void) {
-  UIControlSetting settings[4];
+  UIControlSetting settings[5];
   int settingCount = GetUIControlSettings(settings);
   Rectangle panelRect = GetUIControlsPanelRect(settingCount);
   Vector2 mouse = {(float)GetMouseX(), (float)GetMouseY()};
@@ -809,17 +1039,17 @@ void UpdateUIControls(void) {
   }
 
   for (int i = 0; i < settingCount; i++) {
-    *settings[i].value =
-        ClampInt(*settings[i].value, settings[i].minValue, settings[i].maxValue);
+    *settings[i].value = ClampInt(*settings[i].value, settings[i].minValue,
+                                  settings[i].maxValue);
   }
 
-  uiPointerCaptured = (uiActiveControlIndex >= 0) ||
-                      (CheckCollisionPointRec(mouse, panelRect) &&
-                       (leftDown || rightDown));
+  uiPointerCaptured =
+      (uiActiveControlIndex >= 0) ||
+      (CheckCollisionPointRec(mouse, panelRect) && (leftDown || rightDown));
 }
 
 void RenderUIControls(void) {
-  UIControlSetting settings[4];
+  UIControlSetting settings[5];
   int settingCount = GetUIControlSettings(settings);
   Rectangle panelRect = GetUIControlsPanelRect(settingCount);
   DrawRectangleRec(panelRect, (Color){235, 235, 235, 230});
@@ -872,13 +1102,13 @@ void PlaceDrawnCell(int x, int y, CellType type) {
   }
 
   if (type == BULB_SEED && existing.type == BULB_BLOCK) {
-    int nearest = FindNearestBulbNodeIndex(x, y, 2500);
+    int nearest = FindBulbNodeByReach(x, y, 6);
+    if (nearest < 0) {
+      nearest = FindNearestBulbNodeIndex(x, y);
+    }
     if (nearest >= 0) {
-      bulbNodes[nearest].mass++;
-      if (bulbNodes[nearest].mass > 4096) {
-        bulbNodes[nearest].mass = 4096;
-      }
-      bulbNeedsRebuild = true;
+      AddMassToBulbNode(nearest, 1);
+      MergeBulbClusterAt(nearest);
     }
     return;
   }
@@ -1122,5 +1352,3 @@ int main(void) {
 
   return 0;
 }
-
-
