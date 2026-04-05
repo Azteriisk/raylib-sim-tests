@@ -192,35 +192,26 @@ PixelCell InspectFutureCell(int x, int y) {
   return GET_CELL(nextGrid, x, y);
 }
 
-// Particles can only settle into cells that are empty both now and in the
-// future buffer.
-bool IsCellFree(int x, int y) {
-  return InspectCell(x, y).type == EMPTY && InspectFutureCell(x, y).type == EMPTY;
-}
+typedef enum {
+  MOVE_EMPTY = 0,
+  MOVE_NON_SOLID,
+  MOVE_SOLID
+} MoveCellState;
 
-// Non-solid cells are transparent to movement, but solid cells still block
-// the path. Prefer the future grid when something is already scheduled there.
-bool IsCellBlocked(int x, int y) {
+// Resolve movement occupancy using the future grid first to avoid two moving
+// cells targeting the same empty space.
+MoveCellState GetMoveCellState(int x, int y) {
   PixelCell futureCell = InspectFutureCell(x, y);
   if (futureCell.type != EMPTY) {
-    return IsSolid(futureCell.type);
+    return IsSolid(futureCell.type) ? MOVE_SOLID : MOVE_NON_SOLID;
   }
-  return IsSolid(InspectCell(x, y).type);
-}
 
-// Count how many neighbors of a certain type are touching a cell
-int CountNeighbors(int x, int y, CellType searchType) {
-  int count = 0;
-  // Iterate through the 3x3 block surrounding the cell
-  for (int dy = -1; dy <= 1; dy++) {
-    for (int dx = -1; dx <= 1; dx++) {
-      if (dx == 0 && dy == 0)
-        continue; // Skip ourselves
-      if (InspectCell(x + dx, y + dy).type == searchType)
-        count++;
-    }
+  PixelCell currentCell = InspectCell(x, y);
+  if (currentCell.type == EMPTY) {
+    return MOVE_EMPTY;
   }
-  return count;
+
+  return IsSolid(currentCell.type) ? MOVE_SOLID : MOVE_NON_SOLID;
 }
 
 // -------------------------------------------------------------
@@ -238,12 +229,12 @@ bool TryScatter(int x, int targetY, int *nextX, int *nextY) {
   int firstDir = goLeftFirst ? -1 : 1;
   int secondDir = goLeftFirst ? 1 : -1;
 
-  if (IsCellFree(x + firstDir, targetY)) {
+  if (GetMoveCellState(x + firstDir, targetY) == MOVE_EMPTY) {
     *nextX = x + firstDir;
     *nextY = targetY;
     return true;
   }
-  if (IsCellFree(x + secondDir, targetY)) {
+  if (GetMoveCellState(x + secondDir, targetY) == MOVE_EMPTY) {
     *nextX = x + secondDir;
     *nextY = targetY;
     return true;
@@ -258,11 +249,12 @@ bool ApplyGravity(int x, int y, int *nextX, int *nextY) {
   // Skip through non-colliding occupied cells and only stop on truly empty
   // landing spaces.
   for (int scanY = y - 1; scanY >= 0; scanY--) {
-    if (IsCellBlocked(x, scanY)) {
+    MoveCellState state = GetMoveCellState(x, scanY);
+    if (state == MOVE_SOLID) {
       break;
     }
 
-    if (IsCellFree(x, scanY)) {
+    if (state == MOVE_EMPTY) {
       openCellsSeen++;
       *nextY = scanY;
 
@@ -283,12 +275,11 @@ bool ApplyGravity(int x, int y, int *nextX, int *nextY) {
 
 
 // Visual Oscillations: Pulses colors dynamically over time
-void ApplyShaderOscillation(int x, int y, PixelCell *cell) {
-  float r = sinf(cell->timeAlive * 3.0f + x * 0.1f) * 127.0f + 128.0f;
-  float g = sinf(cell->timeAlive * 2.0f + y * 0.1f) * 127.0f + 128.0f;
-  float b = sinf(cell->timeAlive * 4.0f) * 127.0f + 128.0f;
-  cell->color =
-      (Color){(unsigned char)r, (unsigned char)g, (unsigned char)b, 255};
+Color GetShaderOscillatedColor(int x, int y, float timeAlive) {
+  float r = sinf(timeAlive * 3.0f + x * 0.1f) * 127.0f + 128.0f;
+  float g = sinf(timeAlive * 2.0f + y * 0.1f) * 127.0f + 128.0f;
+  float b = sinf(timeAlive * 4.0f) * 127.0f + 128.0f;
+  return (Color){(unsigned char)r, (unsigned char)g, (unsigned char)b, 255};
 }
 
 // -------------------------------------------------------------
@@ -312,12 +303,7 @@ void ApplyPixelRules(int x, int y, float deltaTime, PixelCell cell) {
     }
   }
 
-  // 2. Custom Visual Component Logic
-  if (cell.type == SHADER_BLOCK) {
-    ApplyShaderOscillation(x, y, &cell);
-  }
-
-  // Universally push final evaluated state to the next active buffer
+  // 2. Push final evaluated state to the next active buffer
   GET_CELL(nextGrid, nextX, nextY) = cell;
 }
 
@@ -345,8 +331,12 @@ void RenderWorld(void) {
     for (int x = 0; x < gridCols; x++) {
       PixelCell cell = GET_CELL(currentGrid, x, y);
       if (cell.type != EMPTY) {
+        Color drawColor = cell.color;
+        if (cell.type == SHADER_BLOCK) {
+          drawColor = GetShaderOscillatedColor(x, y, cell.timeAlive);
+        }
         int screenY = GetScreenHeight() - (y + 1) * TILE_SIZE;
-        DrawRectangle(x * TILE_SIZE, screenY, TILE_SIZE, TILE_SIZE, cell.color);
+        DrawRectangle(x * TILE_SIZE, screenY, TILE_SIZE, TILE_SIZE, drawColor);
       }
     }
   }
@@ -362,11 +352,50 @@ void RenderWorld(void) {
 // INPUT & INTERACTION HELPERS
 // -------------------------------------------------------------
 
+typedef enum {
+  INPUT_BIND_MOUSE_BUTTON = 0,
+  INPUT_BIND_KEY
+} InputBindingType;
+
+typedef struct {
+  InputBindingType triggerType;
+  int triggerCode;
+  CellType resultCellType;
+} InputBinding;
+
+// Input priority is defined by array order.
+const InputBinding kInputBindings[] = {
+    {INPUT_BIND_MOUSE_BUTTON, MOUSE_BUTTON_LEFT, SAND},
+    {INPUT_BIND_MOUSE_BUTTON, MOUSE_BUTTON_RIGHT, SHADER_BLOCK},
+    {INPUT_BIND_KEY, KEY_SPACE, WATER},
+};
+
+bool IsBindingActive(const InputBinding *binding) {
+  switch (binding->triggerType) {
+  case INPUT_BIND_MOUSE_BUTTON:
+    return IsMouseButtonDown(binding->triggerCode);
+  case INPUT_BIND_KEY:
+    return IsKeyDown(binding->triggerCode);
+  default:
+    return false;
+  }
+}
+
+const InputBinding *GetActiveInputBinding(void) {
+  int count = sizeof(kInputBindings) / sizeof(kInputBindings[0]);
+  for (int i = 0; i < count; i++) {
+    if (IsBindingActive(&kInputBindings[i])) {
+      return &kInputBindings[i];
+    }
+  }
+  return NULL;
+}
+
 // Place gravity-affected materials without overwriting non-solid occupied cells
 // (for example shader blocks): insert them at the first reachable empty space
 // below.
 void PlaceDrawnCell(int x, int y, CellType type) {
-  PixelCell existing = InspectCell(x, y);
+  PixelCell existing = GET_CELL(currentGrid, x, y);
 
   // Default painter behavior: draw directly into empty cells, solid cells, or
   // non-gravity types.
@@ -379,7 +408,7 @@ void PlaceDrawnCell(int x, int y, CellType type) {
   // Gravity materials passing through non-solid occupied cells should settle
   // in the first empty slot below without erasing the non-solid cell.
   for (int scanY = y - 1; scanY >= 0; scanY--) {
-    PixelCell scanned = InspectCell(x, scanY);
+    PixelCell scanned = GET_CELL(currentGrid, x, scanY);
     if (IsSolid(scanned.type)) {
       break;
     }
@@ -430,22 +459,20 @@ void HandleUserInputs(void) {
   static int lastGridX = -1;
   static int lastGridY = -1;
 
-  // Track the hardware natively while idling so that a fresh click always originates identically at the cursor!
-  if (!IsMouseButtonDown(MOUSE_BUTTON_LEFT) &&
-      !IsMouseButtonDown(MOUSE_BUTTON_RIGHT) && !IsKeyDown(KEY_SPACE)) {
+  const InputBinding *activeBinding = GetActiveInputBinding();
+
+  // Track the hardware natively while idling so that a fresh click always
+  // originates identically at the cursor.
+  if (activeBinding == NULL) {
     lastGridX = gridX;
     lastGridY = gridY;
   }
 
-  // Natively trace an ultra smooth, gapless line strictly through our Array space!
-  if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
-    SpawnLineBetweenGrids(lastGridX, lastGridY, gridX, gridY, SAND);
-  } else if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
-    SpawnLineBetweenGrids(lastGridX, lastGridY, gridX, gridY, SHADER_BLOCK);
-  }
-
-  if (IsKeyDown(KEY_SPACE)) {
-    SpawnLineBetweenGrids(lastGridX, lastGridY, gridX, gridY, WATER);
+  // Natively trace an ultra smooth, gapless line strictly through our Array
+  // space.
+  if (activeBinding != NULL) {
+    SpawnLineBetweenGrids(lastGridX, lastGridY, gridX, gridY,
+                          activeBinding->resultCellType);
   }
 
   lastGridX = gridX;
